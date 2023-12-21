@@ -22,6 +22,7 @@ func main() {
 
 	m := mr.MakeCoordinator(os.Args[1:], 10)
 	for m.Done() == false {
+		fmt.Println("listening")
 		time.Sleep(time.Second)
 	}
 
