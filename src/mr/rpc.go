@@ -24,13 +24,21 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type GetWorkArgs struct {
+	WorkerN int
 }
 
 type GetWorkReply struct {
-	workType string
+	WorkType        string
+	WorkKey         string
+	NReduce         int
+	AssignedWorkerN int
+	ReduceBatch     int
 }
 
 type ReportWorkDoneArgs struct {
+	WorkType  string
+	WorkKey   string
+	WorkBatch int
 }
 type ReportWorkDoneReply struct {
 }
