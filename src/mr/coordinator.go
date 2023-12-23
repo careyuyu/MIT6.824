@@ -29,6 +29,8 @@ type Coordinator struct {
 	reduceJobPool        chan int
 	reduceJobRemaining   int
 	reduceJobRemainingMU sync.Mutex
+
+	jobsDone bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -91,7 +93,7 @@ func (c *Coordinator) GetWork(args *GetWorkArgs, reply *GetWorkReply) error {
 	} else if c.reduceJobRemaining != 0 { //map jobs are done, assign reduce jobs
 		select {
 		case batchNum := <-c.reduceJobPool:
-			fmt.Printf("map job %v is assigned to %v\n", batchNum, args.WorkerN)
+			fmt.Printf("reduce job %v is assigned to %v\n", batchNum, args.WorkerN)
 			reply.WorkType = "reduce"
 			reply.ReduceBatch = batchNum
 			go c.checkReduceWorkDone(batchNum)
@@ -138,7 +140,7 @@ func (c *Coordinator) ReportWorkDone(args *ReportWorkDoneArgs, reply *ReportWork
 			fmt.Printf("reduce job %v is done, remaining %v\n", args.WorkBatch, c.reduceJobRemaining)
 		}
 		if c.reduceJobRemaining == 0 { //TODO handle finish
-
+			c.jobsDone = true
 		}
 	}
 	return nil
@@ -161,11 +163,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	return c.jobsDone
 }
 
 // create a Coordinator.

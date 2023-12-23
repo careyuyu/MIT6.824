@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 import "log"
@@ -22,6 +23,9 @@ type ByKey []KeyValue
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+func (a KeyValue) String() string {
+	return fmt.Sprintf("%v: %v", a.Key, a.Value)
+}
 
 type WorkerStatus struct {
 	workerN                     int
@@ -29,9 +33,7 @@ type WorkerStatus struct {
 	reducef                     func(string, []string) string
 	nReduce                     int
 	intermediateFileInitialized bool
-	intermediateFiles           []*os.File
-	intermediateFileEncoders    []*json.Encoder
-	intermediateFileClosed      bool
+	intermediateFilesName       []string
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -51,7 +53,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		reducef:                     reducef,
 		nReduce:                     -1,
 		intermediateFileInitialized: false,
-		intermediateFileClosed:      false,
 	}
 	// Your worker implementation here.
 	done := false
@@ -62,32 +63,32 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 // create the intermediate files for the worker, if failed will return false
-func (w *WorkerStatus) initializeIntermediateFiles() bool {
+func (w *WorkerStatus) initIntermediateFiles() bool {
+	w.intermediateFilesName = make([]string, w.nReduce)
 	for i := 0; i < w.nReduce; i++ {
-		//src / mr / gfs / intermediateFiles
+		// create gfs/intermediateFiles/files.txt
 		filename := fmt.Sprintf("./intermediateFiles/mr-%d-%d.txt", w.workerN, i)
-		file, err := os.Create(filename)
-		if err != nil {
+		w.intermediateFilesName[i] = filename
+		if file, err := os.Create(filename); err != nil {
 			fmt.Printf("creation of mr-%d-%d failed due to %v\n", w.workerN, i, err.Error())
 			return false
+		} else {
+			file.Close() //close the file after creation
 		}
-		w.intermediateFiles = append(w.intermediateFiles, file)
-		w.intermediateFileEncoders = append(w.intermediateFileEncoders, json.NewEncoder(file))
 	}
+	w.intermediateFileInitialized = true
 	return true
 }
 
-func (w *WorkerStatus) closeIntermediateFiles() {
-	if w.intermediateFileClosed {
-		return
+func closeIntermediateFiles(fileList []*os.File) {
+	for _, file := range fileList {
+		if err := file.Close(); err != nil {
+			continue
+		}
 	}
-	for _, file := range w.intermediateFiles {
-		file.Close()
-	}
-	w.intermediateFileClosed = true
 }
 
-// CallGetWork get a work, return true if ready for new job, false otherwise
+// CallGetWork get a work, return false if ready for new job, true if all jobs done
 func (w *WorkerStatus) CallGetWork() bool {
 	args := GetWorkArgs{WorkerN: w.workerN}
 	reply := GetWorkReply{}
@@ -100,15 +101,15 @@ func (w *WorkerStatus) CallGetWork() bool {
 			if !w.intermediateFileInitialized {
 				w.workerN = reply.AssignedWorkerN
 				w.nReduce = reply.NReduce
-				success := w.initializeIntermediateFiles()
+				success := w.initIntermediateFiles()
 				if !success {
-					return false
+					return true
 				}
 			}
 			w.handleMapJob(reply.WorkKey)
 			return false
 		case "reduce":
-			w.closeIntermediateFiles()
+			//w.closeIntermediateFiles()
 			fmt.Printf("got reduce job %v\n", reply.WorkKey)
 			w.handleReduceJob(reply.ReduceBatch)
 			return false
@@ -121,7 +122,7 @@ func (w *WorkerStatus) CallGetWork() bool {
 			return true
 		default:
 			fmt.Printf("got no job\n")
-			w.closeIntermediateFiles()
+			//w.closeIntermediateFiles()
 			return true
 		}
 	} else {
@@ -134,28 +135,44 @@ func (w *WorkerStatus) CallGetWork() bool {
 // it should read the file with jobKey, use map function, and append result to intermediate file
 // the intermediate file has batch number associated with key's hash
 func (w *WorkerStatus) handleMapJob(jobKey string) {
+	//read the file for map task
 	fmt.Printf("handling map job %v \n", jobKey)
 	filename := fmt.Sprintf("../main/%v", jobKey)
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
+		return //return on err so CallReportMapDone not called
 	}
 	content, err := io.ReadAll(file)
 	if err != nil {
 		log.Fatalf("cannot read %v", filename)
+		return //return on err so CallReportMapDone not called
 	}
 	file.Close()
-	kva := w.mapf(filename, string(content))
+	kva := w.mapf(jobKey, string(content))
+	//write the intermediate kv values to intermediate files
+	//first create the encoder for each files
+	intermediateFiles := make([]*os.File, len(w.intermediateFilesName))
+	encoders := make([]*json.Encoder, len(w.intermediateFilesName))
+	for i, intermediateFileName := range w.intermediateFilesName {
+		if file, err := os.OpenFile(intermediateFileName, os.O_WRONLY|os.O_APPEND, 0644); err != nil {
+			return
+		} else {
+			intermediateFiles[i] = file
+			encoders[i] = json.NewEncoder(file)
+		}
+	}
+	//write the kv values to file
 	for _, kv := range kva {
 		//fmt.Printf("%v, %v\n", kv.Key, kv.Value)
 		fileIndex := ihash(kv.Key) % w.nReduce
-		//enc := json.NewEncoder(w.intermediateFiles[fileIndex])
-		err := w.intermediateFileEncoders[fileIndex].Encode(&kv)
-		if err != nil {
-			fmt.Printf("writing intermediate file from %v failed\n", w.workerN)
-			break
+		if err := encoders[fileIndex].Encode(&kv); err != nil {
+			fmt.Printf("writing intermediate file from %v failed -- %v\n", w.workerN, err.Error())
+			return //return on err so CallReportMapDone not called
 		}
 	}
+	//close the files
+	closeIntermediateFiles(intermediateFiles)
 
 	w.CallReportMapDone(jobKey)
 }
@@ -175,15 +192,68 @@ func (w *WorkerStatus) CallReportMapDone(jobKey string) {
 // append them to intermediate, sort the intermediate, then apply reduce, then write output to mr-out-%batchNum
 func (w *WorkerStatus) handleReduceJob(batchNum int) {
 	fmt.Printf("handling reduce job %v \n", batchNum)
-	//intermediate := []KeyValue{}
+	kva := []KeyValue{}
+
+	//get all files for the batch mr-*-batchNum.txt
 	files, err := filepath.Glob(fmt.Sprintf("./intermediateFiles/mr-*-%v.txt", batchNum))
 	if err != nil {
 		fmt.Printf("Error finding files for reduce job %v\n", batchNum)
 	}
-	for _, file := range files {
-		fmt.Printf("reading file: %v \n", file)
+	//append the kv pairs to kva for each file
+	//return at any err so CallReportReduceDone don't get called
+	for _, fileName := range files {
+		fmt.Printf("reading file: %v \n", fileName)
+		file, err := os.Open(fileName)
+		if err != nil {
+			fmt.Printf("error reading file: %v \n", fileName)
+			file.Close()
+			return
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				if err.Error() != "EOF" {
+					fmt.Println("ERROR decoding file", err.Error())
+					file.Close()
+					return
+				}
+				file.Close()
+				break
+			}
+			kva = append(kva, kv)
+		}
+		file.Close()
+	}
+	//sort the kva for the batch
+	sort.Sort(ByKey(kva))
+	//create a temp file for the result
+	oname := fmt.Sprintf("mr-out-%v-tempBy-%v", batchNum, w.workerN)
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to temp file
+	//
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := w.reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
 	}
 
+	ofile.Close()
 	w.CallReportReduceDone(batchNum)
 }
 
