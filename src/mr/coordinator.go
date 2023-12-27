@@ -3,6 +3,8 @@ package mr
 import (
 	"fmt"
 	"log"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -20,7 +22,7 @@ type Coordinator struct {
 
 	mapJobStatus      map[string]bool //true if the map file with key is done
 	mapJobStatusMU    sync.Mutex      //mu for map job status
-	mapJobPool        chan string     //channel for remaining map job
+	mapJobPool        chan MapJob     //channel for remaining map job
 	mapJobRemaining   int
 	mapJobRemainingMU sync.Mutex
 
@@ -31,6 +33,11 @@ type Coordinator struct {
 	reduceJobRemainingMU sync.Mutex
 
 	jobsDone bool
+}
+
+type MapJob struct {
+	key string
+	id  string
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -44,12 +51,12 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 // checks after 10 seconds if a map work has been done. if not, push the map work back to remaining task
-func (c *Coordinator) checkMapWorkDone(key string) {
+func (c *Coordinator) checkMapWorkDone(job MapJob) {
 	time.Sleep(time.Second * 10)
 	c.mapJobStatusMU.Lock()
 	defer c.mapJobStatusMU.Unlock()
-	if !c.mapJobStatus[key] {
-		go func() { c.mapJobPool <- key }()
+	if !c.mapJobStatus[job.key] {
+		go func() { c.mapJobPool <- job }()
 	}
 }
 
@@ -75,25 +82,26 @@ func (c *Coordinator) GetWork(args *GetWorkArgs, reply *GetWorkReply) error {
 	fmt.Printf("GetWork is called\n")
 	if c.mapJobRemaining != 0 { //map jobs not finished, assign to worker if there's any remaining from job channel
 		select {
-		case workKey := <-c.mapJobPool: //there's job in channel
+		case mapJob := <-c.mapJobPool: //there's job in channel
 			//assign worker number if not assigned
-			if args.WorkerN == -1 {
-				reply.AssignedWorkerN = c.assignWorkerNum()
+			if args.WorkerId == -1 {
+				reply.AssignedWorkerId = c.assignWorkerNum()
 			} else {
-				reply.AssignedWorkerN = args.WorkerN
+				reply.AssignedWorkerId = args.WorkerId
 			}
-			fmt.Printf("map job %v is assigned to %v\n", workKey, reply.AssignedWorkerN)
+			fmt.Printf("map job %v is assigned to %v\n", mapJob.key, reply.AssignedWorkerId)
 			reply.WorkType = "map"
-			reply.WorkKey = workKey
+			reply.WorkKey = mapJob.key
+			reply.WorkId = mapJob.id
 			reply.NReduce = c.nReduce
-			go c.checkMapWorkDone(workKey) //thread to check if assigned work is done
+			go c.checkMapWorkDone(mapJob) //thread to check if assigned work is done
 		default: //map job not done and no job left in channel, should idle
 			reply.WorkType = "idle"
 		}
 	} else if c.reduceJobRemaining != 0 { //map jobs are done, assign reduce jobs
 		select {
 		case batchNum := <-c.reduceJobPool:
-			fmt.Printf("reduce job %v is assigned to %v\n", batchNum, args.WorkerN)
+			fmt.Printf("reduce job %v is assigned to %v\n", batchNum, args.WorkerId)
 			reply.WorkType = "reduce"
 			reply.ReduceBatch = batchNum
 			go c.checkReduceWorkDone(batchNum)
@@ -146,6 +154,30 @@ func (c *Coordinator) ReportWorkDone(args *ReportWorkDoneArgs, reply *ReportWork
 	return nil
 }
 
+func deleteAllFilesInDir(dirPath string) error {
+	// Walk through the directory
+	return filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip the directory itself
+		if path == dirPath {
+			return nil
+		}
+
+		// Check if it's a file (and not a directory)
+		if !info.IsDir() {
+			// Remove the file
+			err := os.Remove(path)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
 	rpc.Register(c)
@@ -172,18 +204,19 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		nReduce:            nReduce,
-		mapJobPool:         make(chan string),
+		mapJobPool:         make(chan MapJob),
 		mapJobStatus:       make(map[string]bool),
 		reduceJobPool:      make(chan int),
 		reduceJobStatus:    make(map[int]bool),
 		reduceJobRemaining: nReduce,
 		curWorkerNum:       0,
 	}
-	for _, v := range files {
-		go func(jobKey string) { c.mapJobPool <- jobKey }(v)
+	for i, v := range files {
+		go func(jobKey string, jobId int) { c.mapJobPool <- MapJob{id: strconv.Itoa(jobId), key: jobKey} }(v, i)
 		c.mapJobStatus[v] = false
 		c.mapJobRemaining += 1
 	}
+	deleteAllFilesInDir("./intermediateFiles")
 	fmt.Println("coordinator initialized")
 	c.server()
 	return &c
