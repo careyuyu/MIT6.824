@@ -216,7 +216,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		c.mapJobStatus[v] = false
 		c.mapJobRemaining += 1
 	}
-	deleteAllFilesInDir("./intermediateFiles")
+	deleteAllFilesInDir("../intermediateFiles")
 	fmt.Println("coordinator initialized")
 	c.server()
 	return &c
